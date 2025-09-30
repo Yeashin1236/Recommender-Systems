@@ -31,13 +31,16 @@ function populateUserDropdown() {
     const userSelect = document.getElementById('user-select');
     userSelect.innerHTML = '';
     
-    // Add users (assuming user IDs are sequential from 1 to numUsers)
-    for (let i = 1; i <= numUsers; i++) {
+    // Get unique user IDs from the ratings data
+    const userIds = [...new Set(ratings.map(r => r.userId))];
+    
+    // Add users to the dropdown
+    userIds.forEach(userId => {
         const option = document.createElement('option');
-        option.value = i;
-        option.textContent = `User ${i}`;
+        option.value = userId;
+        option.textContent = `User ${userId}`;
         userSelect.appendChild(option);
-    }
+    });
 }
 
 function populateMovieDropdown() {
@@ -53,116 +56,86 @@ function populateMovieDropdown() {
     });
 }
 
-function createModel(numUsers, numMovies, latentDim = 10) {
-    // User input
-    const userInput = tf.input({shape: [1], name: 'userInput'});
-    
-    // Movie input  
-    const movieInput = tf.input({shape: [1], name: 'movieInput'});
-    
-    // User embedding
-    const userEmbedding = tf.layers.embedding({
-        inputDim: numUsers + 1,
-        outputDim: latentDim,
-        name: 'userEmbedding'
-    }).apply(userInput);
-    
-    // Movie embedding
-    const movieEmbedding = tf.layers.embedding({
-        inputDim: numMovies + 1,
-        outputDim: latentDim, 
-        name: 'movieEmbedding'
-    }).apply(movieInput);
-    
-    // Reshape embeddings to flatten them
-    const userVector = tf.layers.flatten().apply(userEmbedding);
-    const movieVector = tf.layers.flatten().apply(movieEmbedding);
-    
-    // Dot product of user and movie vectors
-    const dotProduct = tf.layers.dot({axes: 1}).apply([userVector, movieVector]);
-    
-    // Reshape to get a single output value
-    const prediction = tf.layers.reshape({targetShape: [1]}).apply(dotProduct);
-    
-    // Create model
-    const model = tf.model({
-        inputs: [userInput, movieInput],
-        outputs: prediction
-    });
-    
-    return model;
-}
-
 async function trainModel() {
     try {
         isTraining = true;
-        document.getElementById('predict-btn').disabled = true;
         
-        // Create model
-        model = createModel(numUsers, numMovies, 10);
+        // Define model architecture
+        const numLatentFactors = 8;
         
-        // Compile model
-        model.compile({
-            optimizer: tf.train.adam(0.001),
-            loss: 'meanSquaredError'
+        const userEmbedding = tf.layers.embedding({
+            inputDim: numUsers + 1,
+            outputDim: numLatentFactors,
+            inputLength: 1,
+            name: 'user-embedding'
         });
         
-        // Prepare training data
-        const userIds = ratings.map(r => r.userId);
-        const movieIds = ratings.map(r => r.movieId);
-        const ratingValues = ratings.map(r => r.rating);
+        const movieEmbedding = tf.layers.embedding({
+            inputDim: numMovies + 1,
+            outputDim: numLatentFactors,
+            inputLength: 1,
+            name: 'movie-embedding'
+        });
+
+        const userInput = tf.layers.input({ shape: [1], name: 'user-input' });
+        const movieInput = tf.layers.input({ shape: [1], name: 'movie-input' });
+
+        const userVec = userEmbedding.apply(userInput);
+        const movieVec = movieEmbedding.apply(movieInput);
         
-        const userTensor = tf.tensor2d(userIds, [userIds.length, 1]);
-        const movieTensor = tf.tensor2d(movieIds, [movieIds.length, 1]);
-        const ratingTensor = tf.tensor2d(ratingValues, [ratingValues.length, 1]);
+        const userFlatten = tf.layers.flatten().apply(userVec);
+        const movieFlatten = tf.layers.flatten().apply(movieVec);
+
+        const dotProduct = tf.layers.dot({ axes: 1 }).apply([userFlatten, movieFlatten]);
         
-        // Train model
-        updateStatus('Training model... (This may take a moment)');
-        
-        await model.fit([userTensor, movieTensor], ratingTensor, {
-            epochs: 10,
+        model = tf.model({ inputs: [userInput, movieInput], outputs: dotProduct });
+        model.compile({ optimizer: 'adam', loss: 'meanSquaredError' });
+
+        // Prepare data for training
+        const userTensors = tf.tensor2d(ratings.map(r => r.userId), [ratings.length, 1]);
+        const movieTensors = tf.tensor2d(ratings.map(r => r.movieId), [ratings.length, 1]);
+        const ratingTensors = tf.tensor2d(ratings.map(r => r.rating), [ratings.length, 1]);
+
+        // Train the model
+        await model.fit([userTensors, movieTensors], ratingTensors, {
+            epochs: 5,
             batchSize: 64,
-            validationSplit: 0.1,
             callbacks: {
                 onEpochEnd: (epoch, logs) => {
-                    updateStatus(`Training epoch ${epoch + 1}/10 - loss: ${logs.loss.toFixed(4)}`);
+                    updateStatus(`Epoch ${epoch + 1}/5, Loss: ${logs.loss.toFixed(4)}`);
                 }
             }
         });
         
         // Clean up tensors
-        tf.dispose([userTensor, movieTensor, ratingTensor]);
-        
-        // Update UI
-        updateStatus('Model training completed successfully!');
+        tf.dispose([userTensors, movieTensors, ratingTensors]);
+
+        updateStatus('Model training complete!');
         document.getElementById('predict-btn').disabled = false;
-        isTraining = false;
         
     } catch (error) {
         console.error('Training error:', error);
         updateStatus('Error training model: ' + error.message, true);
+    } finally {
         isTraining = false;
     }
 }
 
 async function predictRating() {
-    if (isTraining) {
-        updateResult('Model is still training. Please wait...', 'medium');
-        return;
-    }
-    
-    const userId = parseInt(document.getElementById('user-select').value);
-    const movieId = parseInt(document.getElementById('movie-select').value);
-    
-    if (!userId || !movieId) {
-        updateResult('Please select both a user and a movie.', 'medium');
-        return;
-    }
-    
+    if (!model || isTraining) return;
+
     try {
+        const userId = parseInt(document.getElementById('user-select').value);
+        const movieId = parseInt(document.getElementById('movie-select').value);
+
+        if (isNaN(userId) || isNaN(movieId)) {
+            updateResult('Please select a user and a movie.', 'low');
+            return;
+        }
+
         // Create input tensors
-        const userTensor = tf.tensor2d([[userId]]);
-        const movieTensor = tf.tensor2d([[movieId]]);
+        const userTensor = tf.tensor2d([userId], [1, 1]);
+        const movieTensor = tf.tensor2d([movieId], [1, 1]);
         
         // Make prediction
         const prediction = model.predict([userTensor, movieTensor]);
@@ -181,7 +154,7 @@ async function predictRating() {
         else if (predictedRating <= 2) ratingClass = 'low';
         
         updateResult(
-            `Predicted rating for User ${userId} on "${movieTitle}": <strong>${predictedRating.toFixed(2)}/5</strong>`,
+            `Predicted rating for User ${userId} on \"${movieTitle}\": <strong>${predictedRating.toFixed(2)}/5</strong>`,
             ratingClass
         );
         
